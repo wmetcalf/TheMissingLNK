@@ -166,21 +166,21 @@ class ShellExplorerHunter:
     def handle_ooxml(self, filepath):
         with zipfile.ZipFile(filepath, 'r') as z:
             ax_xmls = [f for f in z.namelist() if 'activeX' in f and f.endswith('.xml')]
-            
+
             for ax_xml_path in ax_xmls:
                 try:
                     xml_data = z.read(ax_xml_path)
                     if SHELL_EXPLORER_CLSID_STR.encode('utf-8') in xml_data.upper():
                         print(f"    [+] Found Shell.Explorer.1 definition: {ax_xml_path}")
-                        
+
                         folder = os.path.dirname(ax_xml_path)
                         filename = os.path.basename(ax_xml_path)
                         rels_path = f"{folder}/_rels/{filename}.rels"
-                        
+
                         target_bin = None
                         if rels_path in z.namelist():
                             target_bin = self.parse_rels_for_bin(z.read(rels_path))
-                        
+
                         if target_bin:
                             full_bin_path = f"{folder}/{target_bin}"
                             if full_bin_path not in z.namelist():
@@ -188,6 +188,108 @@ class ShellExplorerHunter:
                             if full_bin_path:
                                 self.carve_stream(z.read(full_bin_path), full_bin_path)
                 except: pass
+
+            # Parse OLE object definitions from document XML files
+            doc_xmls = [f for f in z.namelist()
+                       if (f.endswith('/document.xml') or f.endswith('/workbook.xml') or
+                           f.endswith('/presentation.xml')) and not f.startswith('_')]
+
+            for doc_xml_path in doc_xmls:
+                try:
+                    doc_data = z.read(doc_xml_path).decode('utf-8', errors='ignore')
+                    folder = os.path.dirname(doc_xml_path)
+
+                    # Find OLEObject tags with Shell.Explorer.1 ProgID
+                    ole_objects = re.findall(r'<[^:]+:OLEObject[^>]+>', doc_data, re.IGNORECASE)
+
+                    for ole_obj in ole_objects:
+                        # Extract ProgID
+                        prog_id_match = re.search(r'ProgID=["\']([^"\']+)["\']', ole_obj, re.IGNORECASE)
+                        # Extract CLSID
+                        clsid_match = re.search(r'classid=["\']([^"\']+)["\']', ole_obj, re.IGNORECASE)
+                        # Extract relationship ID
+                        rid_match = re.search(r'r:id=["\']([^"\']+)["\']', ole_obj, re.IGNORECASE)
+
+                        prog_id = prog_id_match.group(1) if prog_id_match else None
+                        clsid = clsid_match.group(1) if clsid_match else None
+                        rid = rid_match.group(1) if rid_match else None
+
+                        # Check if it's Shell.Explorer.1
+                        is_shell_explorer = False
+                        if prog_id and 'shell.explorer' in prog_id.lower():
+                            is_shell_explorer = True
+                        if clsid and clsid.strip('{}').upper() == SHELL_EXPLORER_CLSID_STR.strip('{}').upper():
+                            is_shell_explorer = True
+
+                        if is_shell_explorer:
+                            print(f"    [+] Found OLEObject in {doc_xml_path}:")
+                            if prog_id:
+                                print(f"        ProgID: {prog_id}")
+                            if clsid:
+                                print(f"        CLSID: {clsid}")
+
+                            # Resolve relationship to find binary
+                            if rid:
+                                rels_path = f"{folder}/_rels/{os.path.basename(doc_xml_path)}.rels"
+                                if rels_path in z.namelist():
+                                    rels_data = z.read(rels_path).decode('utf-8', errors='ignore')
+                                    target_match = re.search(
+                                        rf'<Relationship[^>]+Id=["\']' + re.escape(rid) + r'["\'][^>]+Target=["\']([^"\']+)["\']',
+                                        rels_data, re.IGNORECASE
+                                    )
+                                    if target_match:
+                                        target = target_match.group(1)
+                                        # Resolve relative path
+                                        if not target.startswith('/'):
+                                            target_path = f"{folder}/{target}"
+                                        else:
+                                            target_path = target.lstrip('/')
+
+                                        # Normalize path
+                                        target_path = target_path.replace('\\', '/')
+
+                                        print(f"        Target: {target_path}")
+
+                                        # Try to find and process the binary
+                                        if target_path in z.namelist():
+                                            self.process_ooxml_embedding(z, target_path, prog_id or clsid)
+                                        else:
+                                            # Try fuzzy match
+                                            matches = [n for n in z.namelist() if n.endswith(os.path.basename(target))]
+                                            if matches:
+                                                self.process_ooxml_embedding(z, matches[0], prog_id or clsid)
+                                            else:
+                                                print(f"        [!] Binary not found: {target_path}")
+                except Exception as e:
+                    pass
+
+            # Fallback: Check all embeddings folders for orphaned objects
+            embeddings = [f for f in z.namelist()
+                         if 'embedding' in f.lower() and not f.endswith('/')]
+
+            for emb_path in embeddings:
+                try:
+                    emb_data = z.read(emb_path)
+                    # Check for Shell.Explorer.1 signatures in the embedded data
+                    if SHELL_EXPLORER_CLSID_BYTES in emb_data or REGEX_SHELL_EXPLORER.search(emb_data):
+                        print(f"    [+] Found Shell.Explorer.1 signature in orphaned embedding: {emb_path}")
+                        self.process_ooxml_embedding(z, emb_path, "Unknown (orphaned)")
+                except: pass
+
+    def process_ooxml_embedding(self, zipfile_obj, emb_path, identifier):
+        """Process an OOXML embedded object"""
+        try:
+            emb_data = zipfile_obj.read(emb_path)
+            emb_stream = io.BytesIO(emb_data)
+
+            if olefile.isOleFile(emb_stream):
+                print(f"        [+] Processing OLE compound file: {emb_path}")
+                self.handle_legacy(emb_stream, source_desc=f"OOXML_{identifier}_{emb_path}", force_scan=True)
+            else:
+                # Raw data fallback
+                self.carve_stream(emb_data, f"OOXML_{identifier}_{emb_path}")
+        except Exception as e:
+            print(f"        [!] Error processing {emb_path}: {e}")
 
     def parse_rels_for_bin(self, rels_data):
         try:
