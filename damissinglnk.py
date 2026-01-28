@@ -87,11 +87,12 @@ class ShellExplorerHunter:
 
         print(f"[*] Analyzing: {filename}")
         try:
-            if is_zip:
-                self.handle_ooxml(filepath)
-            elif is_ole:
+            if is_ole:
                 # Pass path to legacy handler
-                self.handle_legacy(filepath) 
+                force_scan = self.detect_shell_explorer_raw(filepath)
+                self.handle_legacy(filepath, force_scan=force_scan) 
+            elif is_zip:
+                self.handle_ooxml(filepath)
             elif is_rtf and RTF_SUPPORT:
                 self.handle_rtf(filepath)
         except Exception as e:
@@ -144,6 +145,20 @@ class ShellExplorerHunter:
                              self.carve_stream(obj.oledata, f"RTF_Raw_Obj_{i}")
         except Exception as e:
             print(f"    [!] RTF Parsing Error: {e}")
+
+    def detect_shell_explorer_raw(self, filepath):
+        # Quick raw scan to decide whether to force-scan all OLE streams
+        try:
+            data = open(filepath, "rb").read()
+        except Exception:
+            return False
+        if SHELL_EXPLORER_CLSID_BYTES in data:
+            return True
+        if REGEX_SHELL_EXPLORER.search(data):
+            return True
+        if LNK_CLSID_BYTES in data or LNK_HEADER_SIG in data:
+            return True
+        return False
 
     # =========================================================================
     # OOXML HANDLER (.docx, .xlsx)
