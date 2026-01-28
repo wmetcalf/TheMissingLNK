@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.dumps/
+dumps/
+*.bin
+*.log
