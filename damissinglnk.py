@@ -17,6 +17,15 @@ except ImportError:
     RTF_SUPPORT = False
     print("[!] Warning: oletools.rtfobj not found. RTF support disabled (pip install oletools).")
 
+# Import MSO/ActiveMime parsing
+try:
+    from oletools.olevba import is_mso_file, mso_file_extract
+    import zlib
+    MSO_SUPPORT = True
+except ImportError:
+    MSO_SUPPORT = False
+    print("[!] Warning: oletools.olevba MSO functions not found. MSO support disabled (pip install oletools).")
+
 # --- CONFIGURATION & CONSTANTS ---
 SHELL_EXPLORER_CLSID_STR = "{EAB22AC3-30C1-11CF-A7EB-0000C05BAE0B}"
 SHELL_EXPLORER_CLSID_BYTES = b'\xC3\x2A\xB2\xEA\xC1\x30\xCF\x11\xA7\xEB\x00\x00\xC0\x5B\xAE\x0B'
@@ -68,11 +77,21 @@ class ShellExplorerHunter:
     def process_file(self, filepath):
         self.current_file = os.path.basename(filepath)
         filename = os.path.basename(filepath)
-        
+
         # 1. Format Detection
         is_zip = zipfile.is_zipfile(filepath)
         is_ole = olefile.isOleFile(filepath)
-        
+
+        # Check for MSO/ActiveMime files
+        is_mso = False
+        if MSO_SUPPORT:
+            try:
+                with open(filepath, 'rb') as f:
+                    data = f.read()
+                    if is_mso_file(data):
+                        is_mso = True
+            except: pass
+
         # Relaxed RTF Check: Just look for '{\rt'
         is_rtf = False
         try:
@@ -82,15 +101,19 @@ class ShellExplorerHunter:
                     is_rtf = True
         except: pass
 
-        if not is_zip and not is_ole and not is_rtf:
+        if not is_zip and not is_ole and not is_rtf and not is_mso:
             return
 
         print(f"[*] Analyzing: {filename}")
         try:
-            if is_ole:
+            if is_mso:
+                # MSO takes priority - extract and process embedded OLE
+                with open(filepath, 'rb') as f:
+                    self.handle_mso(f.read(), os.path.basename(filepath))
+            elif is_ole:
                 # Pass path to legacy handler
                 force_scan = self.detect_shell_explorer_raw(filepath)
-                self.handle_legacy(filepath, force_scan=force_scan) 
+                self.handle_legacy(filepath, force_scan=force_scan)
             elif is_zip:
                 self.handle_ooxml(filepath)
             elif is_rtf and RTF_SUPPORT:
@@ -145,6 +168,32 @@ class ShellExplorerHunter:
                              self.carve_stream(obj.oledata, f"RTF_Raw_Obj_{i}")
         except Exception as e:
             print(f"    [!] RTF Parsing Error: {e}")
+
+    # =========================================================================
+    # MSO/ACTIVEMIME HANDLER
+    # =========================================================================
+    def handle_mso(self, data, source_desc="MSO_File"):
+        """Process MSO/ActiveMime files (oledata.mso, editdata.mso)"""
+        print("    [i] Processing as MSO/ActiveMime...")
+        try:
+            # Extract the compressed OLE data
+            ole_data = mso_file_extract(data)
+            print(f"    [+] Extracted {len(ole_data)} bytes from MSO file")
+
+            # Check if extracted data is an OLE file
+            ole_stream = io.BytesIO(ole_data)
+            if olefile.isOleFile(ole_stream):
+                print(f"    [+] Detected OLE Compound File in extracted MSO data")
+                # Force scan since MSO files are often used for evasion
+                self.handle_legacy(ole_stream, source_desc=f"MSO_{source_desc}", force_scan=True)
+            else:
+                # Fallback: raw scan for Shell.Explorer.1 signatures
+                print(f"    [i] Extracted data is not OLE, scanning for Shell.Explorer.1 signatures...")
+                if SHELL_EXPLORER_CLSID_BYTES in ole_data or REGEX_SHELL_EXPLORER.search(ole_data):
+                    print(f"    [+] Found Shell.Explorer.1 signature in raw MSO data")
+                    self.carve_stream(ole_data, f"MSO_Raw_{source_desc}")
+        except Exception as e:
+            print(f"    [!] MSO Extraction Error: {e}")
 
     def detect_shell_explorer_raw(self, filepath):
         # Quick raw scan to decide whether to force-scan all OLE streams
